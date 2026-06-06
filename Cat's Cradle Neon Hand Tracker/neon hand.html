@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cat's Cradle</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  #video {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+  #c {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+  }
+  #loading {
+    position: fixed; inset: 0;
+    background: #000;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 14px; z-index: 999; font-family: monospace;
+  }
+  #loading h1 { color: #fff; font-size: 26px; letter-spacing: 8px; font-weight: 300; }
+  #loading p  { color: rgba(255,255,255,0.45); font-size: 11px; letter-spacing: 3px; }
+  #start-btn {
+    margin-top: 10px; padding: 11px 34px;
+    background: transparent; border: 1px solid rgba(255,255,255,0.5);
+    color: #fff; font-family: monospace; font-size: 12px;
+    letter-spacing: 4px; cursor: pointer;
+  }
+  #start-btn:hover { background: rgba(255,255,255,0.12); }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="loading">
+  <h1>CAT'S CRADLE</h1>
+  <p>HAND TRACKING</p>
+  <button id="start-btn" onclick="startApp()">START</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+const video  = document.getElementById('video');
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+let handResults   = null;
+let particles     = [];
+let touchCooldown = 0;
+
+// All 21 joints
+const ALL  = Array.from({length: 21}, (_, i) => i);
+
+// Fingertips only
+const TIPS = [4, 8, 12, 16, 20];
+
+// One vivid color per finger
+const FINGER_COLORS = [
+  '#ff00cc', // thumb  — pink
+  '#00ffff', // index  — cyan
+  '#aaff00', // middle — lime
+  '#ff8800', // ring   — orange
+  '#cc44ff', // pinky  — violet
+];
+
+// Skeleton bones (within one hand)
+const BONES = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17],[0,17]
+];
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+async function startApp() {
+  document.getElementById('loading').style.display = 'none';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch(e) { alert('Camera permission needed!'); return; }
+
+  const hands = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+  });
+  hands.setOptions({
+    maxNumHands: 2, modelComplexity: 1,
+    minDetectionConfidence: 0.75, minTrackingConfidence: 0.6
+  });
+  hands.onResults(r => { handResults = r; });
+
+  new Camera(video, {
+    onFrame: async () => { await hands.send({ image: video }); },
+    width: 1280, height: 720
+  }).start();
+
+  render();
+}
+
+// Convert normalized landmark → screen pixel (mirrored)
+function pt(lm) {
+  return { x: (1 - lm.x) * canvas.width, y: lm.y * canvas.height };
+}
+
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+// Glow dot
+function glowDot(x, y, r, color, blur, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.shadowBlur  = blur;
+  ctx.shadowColor = color;
+  ctx.fillStyle   = color;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+// Single glowing line
+function glowLine(x1, y1, x2, y2, color, coreW, glowW, blur, alpha) {
+  // Glow
+  ctx.save();
+  ctx.globalAlpha = alpha * 0.45;
+  ctx.shadowBlur  = blur;
+  ctx.shadowColor = color;
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = glowW;
+  ctx.lineCap     = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.restore();
+
+  // Bright core
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.shadowBlur  = 3;
+  ctx.shadowColor = '#fff';
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth   = coreW;
+  ctx.lineCap     = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ── Main render ──────────────────────────────────────────────────────────────
+function render() {
+  requestAnimationFrame(render);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!handResults?.multiHandLandmarks?.length) { drawParticles(); return; }
+
+  const lmArr  = handResults.multiHandLandmarks;
+  const handed = handResults.multiHandedness || [];
+
+  let leftHand = null, rightHand = null;
+  for (let i = 0; i < lmArr.length; i++) {
+    const label = handed[i]?.label;
+    if      (label === 'Right') leftHand  = lmArr[i];
+    else if (label === 'Left')  rightHand = lmArr[i];
+    else { if (!leftHand) leftHand = lmArr[i]; else rightHand = lmArr[i]; }
+  }
+
+  // Skeletons first (behind strings)
+  for (const lm of lmArr) drawSkeleton(lm);
+
+  // Strings between hands
+  if (leftHand && rightHand) {
+    drawModerateWeb(leftHand, rightHand);
+
+    // Touch → particle burst
+    touchCooldown = Math.max(0, touchCooldown - 1);
+    if (touchCooldown === 0) {
+      for (let i = 0; i < TIPS.length; i++) {
+        const lp = pt(leftHand[TIPS[i]]);
+        const rp = pt(rightHand[TIPS[i]]);
+        if (dist(lp, rp) < 42) {
+          burst((lp.x+rp.x)/2, (lp.y+rp.y)/2, FINGER_COLORS[i], 28);
+          touchCooldown = 20;
+          break;
+        }
+      }
+    }
+  }
+
+  drawParticles();
+}
+
+// ── Skeleton ─────────────────────────────────────────────────────────────────
+function drawSkeleton(lm) {
+  // Bones
+  for (const [a, b] of BONES) {
+    const pa = pt(lm[a]), pb = pt(lm[b]);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth   = 1.8;
+    ctx.shadowBlur  = 5;
+    ctx.shadowColor = 'rgba(255,255,255,0.3)';
+    ctx.lineCap     = 'round';
+    ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // All 21 joints
+  for (let i = 0; i < 21; i++) {
+    const p      = pt(lm[i]);
+    const tipIdx = TIPS.indexOf(i);
+    const isTip  = tipIdx !== -1;
+
+    if (isTip) {
+      const col = FINGER_COLORS[tipIdx];
+      glowDot(p.x, p.y, 18, col,   0,  0.10); // soft outer halo
+      glowDot(p.x, p.y,  9, col,  22,  1.00); // colored glow ring
+      glowDot(p.x, p.y,  3, '#fff', 8, 1.00); // white core
+    } else {
+      glowDot(p.x, p.y,  5, 'rgba(255,255,255,0.9)', 10, 1);
+      glowDot(p.x, p.y,  2, '#ffffff', 2, 1);
+    }
+  }
+}
+
+// ── Moderate Web ──────────────────────────────────────────────────────────────
+// Strategy: each FINGERTIP on left → all 21 joints on right, and vice versa
+// That's 5×21 + 5×21 = 210 lines — visible but not overcrowded
+function drawModerateWeb(left, right) {
+  const lPts = ALL.map(i => pt(left[i]));
+  const rPts = ALL.map(i => pt(right[i]));
+  const W    = canvas.width;
+
+  // Left fingertips → all right joints
+  for (let ti = 0; ti < TIPS.length; ti++) {
+    const tipPt = lPts[TIPS[ti]];
+    const col   = FINGER_COLORS[ti];
+
+    for (let rj = 0; rj < 10; rj++) {
+      const rp = rPts[rj];
+      const d  = dist(tipPt, rp);
+      if (d > W * 0.85) continue;
+
+      // Fade by distance
+      const alpha = Math.pow(1 - d / (W * 0.85), 1.2) * 0.75;
+      if (alpha < 0.06) continue;
+
+      // Thicker line to fingertips, thinner to knuckles
+      const isRTip = TIPS.includes(rj);
+      const coreW  = isRTip ? 1.1 : 0.65;
+      const glowW  = coreW * 4;
+      const blur   = isRTip ? 16 : 9;
+
+      glowLine(tipPt.x, tipPt.y, rp.x, rp.y, col, coreW, glowW, blur, alpha);
+    }
+  }
+
+  // Right fingertips → all left joints
+  for (let ti = 0; ti < TIPS.length; ti++) {
+    const tipPt = rPts[TIPS[ti]];
+    const col   = FINGER_COLORS[ti];
+
+    for (let lj = 0; lj < 10; lj++) {
+      const lp = lPts[lj];
+      const d  = dist(tipPt, lp);
+      if (d > W * 0.85) continue;
+
+      const alpha = Math.pow(1 - d / (W * 0.85), 1.2) * 0.75;
+      if (alpha < 0.06) continue;
+
+      const isLTip = TIPS.includes(lj);
+      const coreW  = isLTip ? 1.1 : 0.65;
+      const glowW  = coreW * 4;
+      const blur   = isLTip ? 16 : 9;
+
+      glowLine(tipPt.x, tipPt.y, lp.x, lp.y, col, coreW, glowW, blur, alpha);
+    }
+  }
+}
+
+// ── Particles ─────────────────────────────────────────────────────────────────
+function burst(x, y, color, count) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 8,
+      vy: (Math.random() - 0.5) * 8 - 2,
+      life: 1,
+      decay: 0.022 + Math.random() * 0.03,
+      r: 2 + Math.random() * 5,
+      color
+    });
+  }
+}
+
+function drawParticles() {
+  particles = particles.filter(p => p.life > 0);
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.18; p.vx *= 0.96;
+    p.life -= p.decay;
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.shadowBlur  = 14;
+    ctx.shadowColor = p.color;
+    ctx.fillStyle   = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+</script>
+</body>
+</html>
